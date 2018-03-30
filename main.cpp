@@ -25,7 +25,8 @@ public:
                  " -d          Use directed graph\n"
                  " -o <file>   Output coordinate csv file\n"
                  " -i <file>   Input graph csv file\n"
-                 " -e <n>      Number loops without change for termination\n")
+                 " -e <n>      Number loops without change for termination\n"
+                 " -s <n>      Max number of candidates involved in swapping per turn\n")
     ,verbosity_(0)
     ,width_(0)
     ,height_(0)
@@ -34,13 +35,14 @@ public:
     ,useGlobalCost_(false)
     ,directed_(false)
     ,endCondition_(1000000)
+    ,maxInSwap_(2)
   {}
 
   bool parseOptions(int argc, char *argv[])
   {
     bool showHelp = false;
     int opt;
-    while ((opt = getopt(argc, argv, "hvx:y:i:gde:")) != -1)
+    while ((opt = getopt(argc, argv, "hvx:y:i:gde:s:")) != -1)
     {
       switch (opt)
       {
@@ -71,6 +73,9 @@ public:
       case 'e':
         endCondition_ = atoi(optarg);
         break;
+      case 's':
+        maxInSwap_ = atoi(optarg);
+        break;
       default:
         std::cout << ">>> Illegal option" << "\n" << helpString_ << std::endl;
         return false;
@@ -86,7 +91,7 @@ public:
     return true;
   }
 
-#define OS(x) #x << ":" << x##_ << " "
+#define OS(x) "\n  " << #x << "=" << x##_
   std::string toString() const
   {
     std::stringstream ss;
@@ -98,7 +103,8 @@ public:
       OS(useGlobalCost) <<
       OS(directed) <<
       OS(output) <<
-      OS(endCondition);
+      OS(endCondition) <<
+      OS(maxInSwap);
     return ss.str();
   }
 
@@ -111,6 +117,7 @@ public:
   bool useGlobalCost_;
   bool directed_;
   int endCondition_;
+  int maxInSwap_;
 } config;
 
 #define DBG(msg) if (config.verbosity_) std::cout << msg << std::endl
@@ -142,7 +149,7 @@ static void read_csv(const std::string& filename,
       graph[from].push_back(std::make_pair(to, n));
       if (!config.directed_)
       {
-	graph[to].push_back(std::make_pair(from, n));
+        graph[to].push_back(std::make_pair(from, n));
       }
     }
     else
@@ -156,9 +163,9 @@ static void read_csv(const std::string& filename,
 }
 
 static void write_csv(const std::string& filename,
-		      const Id2index& id2index,
-		      const Index2position& index2position,
-		      const int width)
+                      const Id2index& id2index,
+                      const Index2position& index2position,
+                      const int width)
 {
   DBG("Writing file " << filename);
   std::ofstream output(filename);
@@ -172,7 +179,7 @@ static void write_csv(const std::string& filename,
 
 IndexGraph createIndexGraph(const IdGraph& idGraph, const Id2index& id2index)
 {
-  IndexGraph indexGraph(id2index.size());    
+  IndexGraph indexGraph(id2index.size());
   for (const auto& node : idGraph)
   {
     for (const auto& link : node.second)
@@ -196,18 +203,17 @@ std::string getGridAsString(const std::vector<int>& position, const int width, I
   std::stringstream ss;
   for (int y=0; y<height; ++y)
   {
-    if (y > 0)
-      ss << std::endl;
+    if (y > 0) ss << std::endl;
     for (int x=0; x<width; ++x)
     {
       if (grid[x][y] < 0)
       {
-	ss << " " << std::setw(6) << "......";
+        ss << " " << std::setw(6) << "......";
       }
       else
       {
-	const int id = std::find_if(id2index.begin(), id2index.end(), [grid, x, y](const std::pair<int, int>& p){return p.second == grid[x][y];})->first;
-	ss << " " << std::setw(6) << id;
+        const int id = std::find_if(id2index.begin(), id2index.end(), [grid, x, y](const std::pair<int, int>& p){return p.second == grid[x][y];})->first;
+        ss << " " << std::setw(6) << id;
       }
     }
   }
@@ -223,7 +229,7 @@ static double dist(const int width, const int p1, const int p2)
 }
 
 static double nodeCost(const std::vector<std::vector<std::pair<int, int> > >& indexGraph, 
-                       const std::vector<int>& index2position,
+                       const Index2position& index2position,
                        const int width,
                        const int nodeIndex)
 {
@@ -233,7 +239,7 @@ static double nodeCost(const std::vector<std::vector<std::pair<int, int> > >& in
     const int p0 = index2position[nodeIndex];
     for (const auto& link : indexGraph[nodeIndex])
     {
-      cost += dist(width, p0, index2position[link.first]); // * link.second;
+      cost += dist(width, p0, index2position[link.first]) * link.second;
     }
   }
   return cost;
@@ -252,41 +258,65 @@ static double gridCost(const std::vector<std::vector<std::pair<int, int> > >& in
   return cost;
 }
 
-static int index2id(const std::map<int, int> id2index, int index)
+static double nodesCost(const std::vector<std::vector<std::pair<int, int> > >& indexGraph, 
+                        const Index2position& index2position,
+                        const int width,
+                        const int* beginIndex,
+                        const int* endIndex)
+{
+  return std::accumulate(beginIndex, endIndex, 0,
+                         [indexGraph, index2position, width](int acc, int index){
+                           return acc + nodeCost(indexGraph, index2position, width, index);});
+}
+
+static int index2id(const Id2index& id2index, int index)
 {
   std::map<int, int>::const_iterator it = std::find_if(id2index.begin(), id2index.end(), [index](std::pair<int, int> x){return x.second == index;});
   return it->first;
 }
 
-static void rearrange(const std::vector<std::vector<std::pair<int, int> > >& indexGraph,
-		      const std::map<int, int>& id2index,
-		      std::vector<int>& index2position,
-		      const int width,
-		      const int endCondition)
+static void rearrange(const IndexGraph& indexGraph,
+                      const Id2index& id2index,
+                      Index2position& index2position,
+                      const int width,
+                      const int endCondition,
+                      const std::size_t maxSwapPerTurn)
 {
+  const int maxSwap2 = std::min(maxSwapPerTurn, index2position.size()) - 2;
+  std::vector<int> candidates(index2position.size());
+  std::iota(candidates.begin(), candidates.end(), 0);
   int succ = 0;
   int fail = 0;
-  for (int i=1;; i++)
+  for (int count=1;; count++)
   {
-    const int i1 = rand() % index2position.size();
-    const int i2 = rand() % index2position.size();
-    if (i1 == i2)
-      continue;
+    const int numCandidates = 2 + (maxSwap2 ? (rand() % maxSwap2) : 0);
+    for (int i=0; i<numCandidates; ++i)
+    {
+      std::swap(candidates[i], candidates[i + rand() % (candidates.size() - i)]);
+    }
 
-    const double pre = config.useGlobalCost_ ?
-      gridCost(indexGraph, index2position, width) :
-      nodeCost(indexGraph, index2position, width, i1) + nodeCost(indexGraph, index2position, width, i2);
-    std::swap(index2position[i1], index2position[i2]);
-    const double post = config.useGlobalCost_ ?
-      gridCost(indexGraph, index2position, width) :
-      nodeCost(indexGraph, index2position, width, i1) + nodeCost(indexGraph, index2position, width, i2);
+    const double pre = config.useGlobalCost_ ? gridCost(indexGraph, index2position, width) :
+      nodesCost(indexGraph, index2position, width, &candidates[0], &candidates[numCandidates]);
+
+    // Rotate the candidates left
+    const int tmp = index2position[candidates[0]];
+    for (int i=1; i<numCandidates; ++i)
+      index2position[candidates[i-1]] = index2position[candidates[i]];
+    index2position[candidates[numCandidates-1]] = tmp;
+
+    const double post = config.useGlobalCost_ ? gridCost(indexGraph, index2position, width):
+      nodesCost(indexGraph, index2position, width, &candidates[0], &candidates[numCandidates]);
 
     if (post >= pre)
     {
-      std::swap(index2position[i1], index2position[i2]);
+      // Rotate the candidates right to restore
+      const int tmp = index2position[candidates[numCandidates-1]];
+      for (int i=numCandidates-1; i>0; --i)
+        index2position[candidates[i]] = index2position[candidates[i-1]];
+      index2position[candidates[0]] = tmp;
       if (++fail > endCondition)
       {
-	break;
+        break;
       }
     }
     else
@@ -297,9 +327,9 @@ static void rearrange(const std::vector<std::vector<std::pair<int, int> > >& ind
       DBG2(getGridAsString(index2position, width, id2index));
     }
 
-    if (config.verbosity_ && (i % 10000000)==0)
+    if (config.verbosity_ && (count % 10000000)==0)
     {
-      DBG(succ << "/" << i << " " << double(succ)/i << ": Global cost=" << gridCost(indexGraph, index2position, width));
+      DBG(succ << "/" << count << " " << double(succ)/count << ": Global cost=" << gridCost(indexGraph, index2position, width));
       DBG2(getGridAsString(index2position, width, id2index));
     }
   }
@@ -328,14 +358,11 @@ int main(int argc, char * argv[])
   assert(indexGraph.size() == id2index.size());
 
   std::vector<int> index2position(height * width);
-  for (auto& p : index2position)
-  {
-    p = &p - &index2position[0];
-  }
+  std::iota(index2position.begin(), index2position.end(), 0);
 
   DBG2("Initial grid\n" << getGridAsString(index2position, width, id2index));
 
-  rearrange(indexGraph, id2index, index2position, width, config.endCondition_);
+  rearrange(indexGraph, id2index, index2position, width, config.endCondition_, config.maxInSwap_);
 
   if (config.output_ != "")
   {
